@@ -1125,6 +1125,23 @@ fn str_to_latin1(s: &str) -> Result<Vec<u8>, S7Error> {
     Ok(bytes)
 }
 
+/// 计算 COTP 连接请求的 `(source_tsap, destination_tsap)`。
+///
+/// source TSAP 首字节是连接类型（PG=0x01 / OP=0x02 / S7=0x03），次字节 0x00。
+/// 旧实现恒为 `0x0100`，使 [`S7Config::connection_type`] 成为死配置（S-9）。
+/// S7-200 / 200Smart / Sinumerik828D 用厂商固定的 TSAP，不参与该编码。
+fn tsaps(config: &S7Config) -> (u16, u16) {
+    match config.plc_type {
+        PlcType::S200 => (0x4D57, 0x4D57),
+        PlcType::S200Smart => (0x1000, 0x3000),
+        PlcType::Sinumerik828D => (0x0400, 0x0D04),
+        _ => (
+            (config.connection_type as u16) << 8,
+            0x0300 + (0x20 * config.rack + config.slot) as u16,
+        ),
+    }
+}
+
 async fn run_actor(
     config: S7Config,
     initial_pdu: u16,
@@ -1178,12 +1195,7 @@ async fn run_actor(
             }
         };
 
-        let (local, remote) = match config.plc_type {
-            PlcType::S200 => (0x4D57, 0x4D57),
-            PlcType::S200Smart => (0x1000, 0x3000),
-            PlcType::Sinumerik828D => (0x0400, 0x0D04),
-            _ => (0x0100, 0x0300 + (0x20 * config.rack + config.slot) as u16),
-        };
+        let (local, remote) = tsaps(&config);
 
         // ---------- 2. 握手 ----------
         let handshake_result = handshake(&mut stream, local, remote, pdu_length).await;
@@ -1711,5 +1723,37 @@ mod tests {
         assert_eq!(s.as_bytes(), &[0xC2, 0xB0, 0x43], "应为 UTF-8 编码的 °C");
         // 读写对称：写侧编码回去必须是原字节
         assert_eq!(str_to_latin1(&s).unwrap(), vec![0xB0, 0x43]);
+    }
+
+    /// S-9：connection_type（PG/OP/S7）编入 local TSAP 首字节。
+    #[test]
+    fn s9_connection_type_lands_in_local_tsap() {
+        let pg = tsaps(&S7Config::default().with_connection_type(0x01));
+        let op = tsaps(&S7Config::default().with_connection_type(0x02));
+        let s7 = tsaps(&S7Config::default().with_connection_type(0x03));
+        // 线上是大端：首字节 = 连接类型，次字节 = 0x00
+        assert_eq!(pg.0.to_be_bytes(), [0x01, 0x00]);
+        assert_eq!(op.0.to_be_bytes(), [0x02, 0x00]);
+        assert_eq!(s7.0.to_be_bytes(), [0x03, 0x00]);
+        assert_ne!(pg.0, op.0);
+        assert_ne!(op.0, s7.0);
+        // remote TSAP（机架/槽位）不受连接类型影响：S1200 rack0 slot2
+        assert_eq!(pg.1, op.1);
+        assert_eq!(pg.1, 0x0300 + 2);
+        // 厂商固定 TSAP 的机型不被 connection_type 覆盖
+        assert_eq!(
+            tsaps(&S7Config::default()
+                .with_plc_type(PlcType::S200)
+                .with_connection_type(0x02))
+            .0,
+            0x4D57
+        );
+        assert_eq!(
+            tsaps(&S7Config::default()
+                .with_plc_type(PlcType::S200Smart)
+                .with_connection_type(0x02))
+            .0,
+            0x1000
+        );
     }
 }
