@@ -162,10 +162,13 @@ impl S7Header {
         let data_length = buf.get_u16();
         let (error_class, error_code) = match message_type {
             S7MessageType::Ack | S7MessageType::AckData if buf.remaining() >= 2 => {
-                let ec = buf.get_u8();
-                let ec = S7ErrorClass::from(buf.get_u8())
-                    .ok_or_else(|| S7Error::Error(format!("Unknown error class: 0x{:02X}", ec)))?;
-                (Some(ec), Some(buf.get_u8()))
+                // 错误区是两个独立字节（S7 头第 10、11 字节）：error class 在前，error code 在后。
+                // 旧实现把第 11 字节当 class 解析（同名变量 ec 覆盖），真实错码丢失。
+                let class_byte = buf.get_u8();
+                let class = S7ErrorClass::from(class_byte).ok_or_else(|| {
+                    S7Error::Error(format!("Unknown error class: 0x{:02X}", class_byte))
+                })?;
+                (Some(class), Some(buf.get_u8()))
             }
             _ => (None, None),
         };
@@ -179,5 +182,39 @@ impl S7Header {
             error_class,
             error_code,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AckData 头 + 错误区：`32 03 0000 0001 0000 0000 85 04`
+    #[test]
+    fn s4_error_region_is_class_then_code() {
+        let frame = [
+            0x32, 0x03, // protocol id / 消息类型 AckData
+            0x00, 0x00, // reserved
+            0x00, 0x01, // pdu reference
+            0x00, 0x00, // parameter length
+            0x00, 0x00, // data length
+            0x85, 0x04, // error class = ErrorOnSupplies, error code = 0x04
+        ];
+        let h = S7Header::from_be_bytes(&frame).unwrap().unwrap();
+        assert_eq!(h.error_class, Some(S7ErrorClass::ErrorOnSupplies));
+        assert_eq!(h.error_class.unwrap().code(), 0x85);
+        assert_eq!(h.error_code, Some(0x04));
+        // 带错误区的头固定 12 字节：parameter/datum 的偏移由它决定
+        assert_eq!(h.byte_len(), 12);
+    }
+
+    #[test]
+    fn s4_no_error_region_parses_as_no_error() {
+        let frame = [
+            0x32, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00,
+        ];
+        let h = S7Header::from_be_bytes(&frame).unwrap().unwrap();
+        assert_eq!(h.error_class, Some(S7ErrorClass::NoError));
+        assert_eq!(h.error_code, Some(0x00));
     }
 }
