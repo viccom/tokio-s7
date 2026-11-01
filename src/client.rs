@@ -1,10 +1,11 @@
 use crate::datum::Datum;
 use crate::error::S7Error;
-use crate::item::{DataItem, RequestItem};
+use crate::item::{DataItem, RequestItem, S7ReturnItem};
 use crate::packet::{S7Data, S7DataCodec};
 use crate::paramter::S7Parameter;
 use crate::types::{
-    CommunicationInfo, CpuInfo, OrderCode, PduType, PlcStatus, PlcType, S7ErrorClass,
+    CommunicationInfo, CpuInfo, OrderCode, PduType, PlcStatus, PlcType, S7Area, S7ErrorClass,
+    S7ReturnCode,
 };
 use futures::{SinkExt, StreamExt};
 use log::{error, info, warn};
@@ -1359,6 +1360,9 @@ async fn handle_write(
     items: &mut Vec<RequestItem>,
     data: Vec<DataItem>,
 ) -> Result<(), S7Error> {
+    // S-1：`create_write_request` 会把 items 移入请求参数，先留存副本，
+    // 写应答逐项校验失败时才能回报是哪一项（RequestItem: Copy，仅一次内存拷贝）。
+    let req_items = items.clone();
     let mut req = S7Data::create_write_request(items, data);
     if let Some(h) = &mut req.header {
         h.pdu_reference = next_ref.fetch_add(1, Ordering::Relaxed);
@@ -1379,6 +1383,7 @@ async fn handle_write(
                 .map_err(|e| S7Error::Error(format!("Parse S7Data: {}", e)))?
                 .ok_or_else(|| S7Error::Error("Not a valid S7 data".to_string()))?;
             check_response(&resp)?;
+            check_write_return_items(&resp, &req_items)?;
             Ok(())
         }
     }
@@ -1433,6 +1438,59 @@ fn check_response(resp: &S7Data) -> Result<(), S7Error> {
         }
     }
     Ok(())
+}
+
+/// S-1：写应答的 item 级返回码校验。
+///
+/// S7 写应答（AckData + WriteVariable）的 datum 是每个请求项一个 `ReturnItem`（1 字节），
+/// 与请求项**同序**。此前只做头级 [`check_response`]，item 级 `return_code` 被整段丢弃
+/// （PLC 回 `0x05 InvalidAddress` 也当成写成功）。任一项非 `Success` 即返回错误，
+/// 错误里带 item 序号、请求地址与返回码。
+fn check_write_return_items(resp: &S7Data, req_items: &[RequestItem]) -> Result<(), S7Error> {
+    let Some(Datum::ReadWrite(datum)) = &resp.datum else {
+        // 无 datum 的应答（异常形态）由 check_response / 上层处理
+        return Ok(());
+    };
+    for (idx, item) in datum.return_items.iter().enumerate() {
+        let S7ReturnItem::Return(ret) = item else {
+            continue;
+        };
+        if ret.return_code != S7ReturnCode::Success {
+            let addr = req_items
+                .get(idx)
+                .map(format_request_item)
+                .unwrap_or_else(|| "<unknown>".to_string());
+            return Err(S7Error::ProtocolError {
+                code: ret.return_code.code() as u32,
+                message: format!(
+                    "write item {} ({}) rejected: {}",
+                    idx,
+                    addr,
+                    ret.return_code.description()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// 诊断用：把请求项还原成 S7 地址文本（`DB1.DBX0.0` / `M10.0`）。
+fn format_request_item(item: &RequestItem) -> String {
+    match item.area {
+        S7Area::DataBlocks | S7Area::InstanceDataBlocks => format!(
+            "{}{}.DBX{}.{}",
+            item.area.abbr(),
+            item.db_number,
+            item.byte_address,
+            item.bit_address
+        ),
+        _ => format!(
+            "{}{}.{}",
+            item.area.abbr(),
+            item.byte_address,
+            item.bit_address
+        ),
+    }
 }
 
 async fn handshake(
@@ -1534,6 +1592,95 @@ async fn handshake(
                 };
 
             Ok(negotiated_pdu)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{S7FunctionCode, S7MessageType};
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    /// 起一个一次性 mock PLC：读完 client 发来的一帧请求（TPKT 头 4 字节 + 剩余），
+    /// 回一段预先编好的应答字节，然后保持连接直到 client 关闭。
+    async fn spawn_mock_plc(response: Vec<u8>) -> TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 4];
+            sock.read_exact(&mut head).await.unwrap();
+            let total = u16::from_be_bytes([head[2], head[3]]) as usize;
+            let mut body = vec![0u8; total.saturating_sub(4)];
+            sock.read_exact(&mut body).await.unwrap();
+            sock.write_all(&response).await.unwrap();
+            sock.flush().await.unwrap();
+            let mut sink = Vec::new();
+            let _ = sock.read_to_end(&mut sink).await;
+        });
+        TcpStream::connect(addr).await.unwrap()
+    }
+
+    /// 构造写应答帧：TPKT + COTP DT + AckData 头（带 2 字节错误区）+ WriteVariable 参数 +
+    /// 每项 1 字节 return_code 的 datum。
+    fn write_response(return_codes: &[u8]) -> Vec<u8> {
+        let param_len: usize = 2;
+        let data_len = return_codes.len();
+        let total = 4 + 3 + 12 + param_len + data_len;
+        let mut f = Vec::with_capacity(total);
+        f.extend_from_slice(&[0x03, 0x00]);
+        f.extend_from_slice(&(total as u16).to_be_bytes());
+        f.extend_from_slice(&[0x02, 0xF0, 0x80]); // COTP DT，last_data_unit=1
+        f.push(0x32); // protocol id
+        f.push(S7MessageType::AckData.code());
+        f.extend_from_slice(&[0x00, 0x00]); // reserved
+        f.extend_from_slice(&0x0001u16.to_be_bytes()); // pdu reference
+        f.extend_from_slice(&(param_len as u16).to_be_bytes());
+        f.extend_from_slice(&(data_len as u16).to_be_bytes());
+        f.extend_from_slice(&[0x00, 0x00]); // error class / error code
+        f.push(S7FunctionCode::WriteVariable.code());
+        f.push(return_codes.len() as u8);
+        f.extend_from_slice(return_codes);
+        f
+    }
+
+    #[tokio::test]
+    async fn s1_write_success_return_code_is_ok() {
+        let mut stream = spawn_mock_plc(write_response(&[0xFF])).await;
+        let mut items = vec![RequestItem::parse_byte("DB1.DBB0", 1).unwrap()];
+        let data = vec![DataItem::create_req_bytes(vec![0x01]).unwrap()];
+        let next_ref = AtomicU16::new(0);
+        handle_write(&mut stream, 960, &next_ref, &mut items, data)
+            .await
+            .expect("return_code=0xFF(Success) 应写成功");
+    }
+
+    #[tokio::test]
+    async fn s1_write_fails_on_item_level_error() {
+        // 第 0 项 Success、第 1 项 0x05 InvalidAddress：必须报错并指出是哪一项。
+        let mut stream = spawn_mock_plc(write_response(&[0xFF, 0x05])).await;
+        let mut items = vec![
+            RequestItem::parse_byte("DB1.DBB0", 1).unwrap(),
+            RequestItem::parse_byte("DB2.DBB0", 1).unwrap(),
+        ];
+        let data = vec![
+            DataItem::create_req_bytes(vec![0x01]).unwrap(),
+            DataItem::create_req_bytes(vec![0x02]).unwrap(),
+        ];
+        let next_ref = AtomicU16::new(0);
+        let err = handle_write(&mut stream, 960, &next_ref, &mut items, data)
+            .await
+            .expect_err("return_code=0x05(InvalidAddress) 不能再当成写成功");
+        match err {
+            S7Error::ProtocolError { code, message } => {
+                assert_eq!(code, 0x05);
+                assert!(message.contains("item 1"), "应指出失败项序号: {message}");
+                assert!(message.contains("DB2.DBX0.0"), "应指出失败项地址: {message}");
+                assert!(message.contains("invalid address"), "应含返回码描述: {message}");
+            }
+            other => panic!("期望 ProtocolError，实际 {other:?}"),
         }
     }
 }
