@@ -528,7 +528,9 @@ impl S7Client {
             return Err(S7Error::Error("read_string: data truncated".into()));
         }
         let chars = &bytes[2..2 + actual_len];
-        Ok(String::from_utf8_lossy(chars).into_owned()) // 使用 ISO-8859-1 兼容
+        // STRING 是 ISO-8859-1（Latin-1）：每个字节直接映射到同码位字符（U+0000..U+00FF），
+        // 与写侧 `str_to_latin1` 对称。`from_utf8_lossy` 会把 0x80-0xFF 全部变成 U+FFFD。
+        Ok(chars.iter().map(|&b| b as char).collect())
     }
 
     /// 读取西门子 STRING 类型（默认最大长度 254）
@@ -1599,7 +1601,7 @@ async fn handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{S7FunctionCode, S7MessageType};
+    use crate::types::{S7DataVariableType, S7FunctionCode, S7MessageType};
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
 
@@ -1682,5 +1684,32 @@ mod tests {
             }
             other => panic!("期望 ProtocolError，实际 {other:?}"),
         }
+    }
+
+    /// S-5：STRING 读按 Latin-1（ISO-8859-1）解码，0x80-0xFF 逐字节映射到同码位字符，
+    /// 与写侧 `str_to_latin1` 对称（旧实现 from_utf8_lossy → U+FFFD 替换字符）。
+    #[tokio::test]
+    async fn s5_read_string_decodes_latin1() {
+        let (tx, mut rx) = mpsc::channel(4);
+        // 桩 actor：应答 STRING 数据区 [max_len=0x0A, actual_len=0x02, 0xB0, 0x43]
+        tokio::spawn(async move {
+            if let Some(Command::Read { reply, .. }) = rx.recv().await {
+                let item = DataItem {
+                    return_code: S7ReturnCode::Success,
+                    data_variable_type: S7DataVariableType::ByteWordDword,
+                    count: 4,
+                    data: vec![0x0A, 0x02, 0xB0, 0x43],
+                };
+                let _ = reply.send(Ok(vec![item]));
+            }
+        });
+        let mut client = S7Client::new(S7Config::default());
+        client.cmd_tx = Some(tx);
+
+        let s = client.read_string("DB1.DBB0", 10).await.unwrap();
+        assert_eq!(s, "°C");
+        assert_eq!(s.as_bytes(), &[0xC2, 0xB0, 0x43], "应为 UTF-8 编码的 °C");
+        // 读写对称：写侧编码回去必须是原字节
+        assert_eq!(str_to_latin1(&s).unwrap(), vec![0xB0, 0x43]);
     }
 }
