@@ -1,0 +1,23 @@
+[package]
+name = "tokio-s7"
+version = "0.1.7"
+edition = "2024"
+
+description = "A library that can be used to communicate with Siemens S7 family PLC devices"
+authors = ["evanyang1120@163.com"]
+repository = "https://github.com/CrayfishGo/tokio-s7"
+license = "Apache-2.0"
+keywords = ["siemens", "s7", "plc", "simatic"]
+categories = ["network-programming", "embedded"]
+readme = "README.md"
+
+
+[dependencies]
+tokio = { version = "1.35.1", default-features = false, features = ["full"] }
+tokio-util = { version = "0.7", default-features = false, features = ["codec"] }
+log = "0.4"          # 日志接口
+env_logger = "0.11"  # 日志实现（输出到控制台）
+thiserror = "2.0.18"
+futures = "0.3.32"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
